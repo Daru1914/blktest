@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+
+import argparse
+import subprocess
+import json
+
+# Функция для парсинга аргументов командной строки
+def parse_arguments():
+    parser = argparse.ArgumentParser(description="Тестирование производительности блочного устройства.")
+    parser.add_argument("-name", required=True, help="Имя теста.")
+    parser.add_argument("-filename", required=True, help="Путь до файла, на котором будет выполняться тестирование.")
+    parser.add_argument("-output", required=True, help="Базовый путь до выходных файлов.")
+    return parser.parse_args()
+
+# Функция для выполнения fio-теста с заданными параметрами
+def run_fio_test(test_name, filename, rw_mode, iodepth):
+    fio_command = [
+        "fio",
+        "--name", test_name,
+        "--filename", filename,
+        "--ioengine=libaio",
+        "--direct=1",
+        "--bs=4k",
+        "--size=1G",
+        "--numjobs=1",
+        f"--rw={rw_mode}",
+        f"--iodepth={iodepth}",
+        "--output-format=json"
+    ]
+    try:
+        print("Executing command:", " ".join(fio_command))  # Печать команды для диагностики
+        result = subprocess.run(fio_command, capture_output=True, text=True, check=True)
+
+        # Вывод JSON результата для диагностики
+        # print("Fio raw output:")
+        # print(result.stdout)
+
+        data = json.loads(result.stdout)
+        job = data["jobs"][0]  # Берем единственный job из вывода
+
+        # Извлекаем данные для чтения или записи
+        mode_data = job["read"] if rw_mode == "randread" else job["write"]
+
+        return {
+            "latency_us": mode_data["lat_ns"]["mean"] / 1000 if "lat_ns" in mode_data else None,  # Задержка в микросекундах
+            "iops": mode_data["iops"],  # IOPS
+            "bandwidth_kbps": mode_data["bw"],  # Пропускная способность (в kB/s)
+            "cpu_usr": job["usr_cpu"],  # Загрузка CPU в пользовательском режиме
+            "cpu_sys": job["sys_cpu"],  # Загрузка CPU в системном режиме
+            "disk_util": data["disk_util"][0]["util"] if "disk_util" in data and data["disk_util"] else None  # Утилизация диска
+        }
+    except subprocess.CalledProcessError as e:
+        print(f"fio failed with exit code {e.returncode}")
+        print(f"Error output: {e.stderr}")
+        raise
+    except json.JSONDecodeError:
+        print("Failed to parse fio output as JSON. Raw output:")
+        print(result.stdout)
+        raise
+
+# Функция для сбора данных производительности
+def collect_performance_data(test_name, filename, rw_modes, iodepth_values):
+    results = []
+    for rw_mode in rw_modes:
+        for iodepth in iodepth_values:
+            job_data = run_fio_test(test_name, filename, rw_mode, iodepth)  # Выполнение fio-теста
+
+            results.append({
+                "rw_mode": rw_mode,
+                "iodepth": iodepth,
+                "latency_us": job_data["latency_us"],
+                "iops": job_data["iops"],
+                "bandwidth_kbps": job_data["bandwidth_kbps"],
+                "cpu_usr": job_data["cpu_usr"],
+                "cpu_sys": job_data["cpu_sys"],
+                "disk_util": job_data["disk_util"]
+            })
+    return results
+
+# Функция для сохранения результатов и генерации графиков
+def save_results_and_generate_graph(results, output_base_name):
+    # Список метрик для анализа
+    metrics = {
+        "latency_us": "Latency (us)",
+        "iops": "IOPS",
+        "bandwidth_kbps": "Bandwidth (kB/s)",
+        "cpu_usr": "CPU Usage (User Mode, %)",
+        "cpu_sys": "CPU Usage (System Mode, %)",
+        "disk_util": "Disk Utilization (%)"
+    }
+
+    for metric, ylabel in metrics.items():
+        gnuplot_script = f"{output_base_name}_{metric}.gnuplot"  # Генерация скрипта для gnuplot
+
+        # Создание файлов данных для графиков
+        mode_files = {}
+        modes = set(result["rw_mode"] for result in results)
+        for mode in modes:
+            mode_file = f"{output_base_name}_{metric}_{mode}.dat"
+            mode_files[mode] = mode_file
+            with open(mode_file, "w") as f:
+                f.write("# IOdepth Value\n")
+                for result in results:
+                    if result["rw_mode"] == mode and result[metric] is not None:
+                        f.write(f"{result['iodepth']} {result[metric]}\n")  # Запись данных
+
+        # Создание скрипта gnuplot
+        with open(gnuplot_script, "w") as f:
+            f.write("set terminal png size 1400,600\n")  # Устанавливаем формат графика
+            f.write(f"set output '{output_base_name}_{metric}.png'\n")  # Путь до выходного файла
+            f.write(f"set title '{ylabel} vs IOdepth'\n")  # Название графика
+            f.write("set xlabel 'IOdepth'\n")  # Ось X
+            f.write(f"set ylabel '{ylabel}'\n")  # Ось Y
+            f.write("set grid\n")
+            f.write("set key outside\n")
+            f.write("plot \\\n")
+
+            # Добавляем строки для каждого режима
+            for idx, (mode, mode_file) in enumerate(mode_files.items()):
+                f.write(f"'{mode_file}' using 1:2 title '{mode}' with linespoints")
+                if idx < len(mode_files) - 1:
+                    f.write(", \\\n")  # Продолжение строки
+                else:
+                    f.write("\n")  # Конец строки
+
+        # Генерация графика с помощью gnuplot
+        try:
+            subprocess.run(["gnuplot", gnuplot_script], check=True)
+        except subprocess.CalledProcessError as e:
+            print(f"Error generating graph with gnuplot: {e}")
+
+if __name__ == "__main__":
+    args = parse_arguments()  # Парсинг аргументов командной строки
+
+    iodepth_values = [1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256]  # Список глубин очереди
+    rw_modes = ["randread", "randwrite"]  # Режимы тестирования
+
+    try:
+        print("Running fio tests...")
+        test_results = collect_performance_data(args.name, args.filename, rw_modes, iodepth_values)
+
+        print("Saving results and generating graphs...")
+        save_results_and_generate_graph(test_results, args.output)
+
+        print(f"Graphs saved to {args.output}_<metric>.png")
+    except Exception as e:
+        print(f"An error occurred: {e}")
